@@ -1,0 +1,10 @@
+ultralytics
+opencv-python
+numpy
+requests
+filterpy
+scipy
+lapx
+insightface
+onnxruntime
+flask
