@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment and secret files
+.env
+.envrc
+
+# Intelligence specific - Ignore local weight files and data
+models/weights/
+data/raw/
+*.log
