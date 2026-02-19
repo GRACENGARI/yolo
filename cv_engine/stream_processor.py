@@ -6,6 +6,7 @@ import logging
 from ultralytics import YOLO
 import numpy as np
 import threading
+import queue
 from flask import Flask, Response, request
 
 # Import deep_sort components
@@ -27,6 +28,36 @@ except (ImportError, ValueError):
 flask_app = Flask(__name__)
 output_frame = None
 lock = threading.Lock()
+
+class SightingReporter:
+    def __init__(self, backend_url):
+        self.backend_url = backend_url
+        self.queue = queue.Queue(maxsize=100)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        self.logger = logging.getLogger("SIGHTING_REPORTER")
+
+    def report(self, data):
+        try:
+            self.queue.put_nowait(data)
+        except queue.Full:
+            self.logger.warning("Reporting queue full, dropping sighting.")
+
+    def _worker(self):
+        while not self.stop_event.is_set():
+            try:
+                data = self.queue.get(timeout=1)
+                try:
+                    res = requests.post(f"{self.backend_url}sightings/", json=data, timeout=1.0)
+                    if res.status_code != 201:
+                        self.logger.error(f"Failed to report sighting: {res.status_code}")
+                except requests.exceptions.RequestException as e:
+                    self.logger.error(f"Network error reporting sighting: {e}")
+                finally:
+                    self.queue.task_done()
+            except queue.Empty:
+                continue
 
 class SimpleEncoder:
     def __call__(self, frame, boxes):
@@ -52,8 +83,15 @@ class StreamProcessor:
         self.logger = logging.getLogger("CV_ENGINE")
         logging.basicConfig(level=logging.INFO)
         
-        self.logger.info("Initializing YOLOv8n (Detection)...")
+        self.logger.info("Initializing YOLOv8n (Detection) with FP16...")
+        # FP16 Half precision for latency optimization
         self.model = YOLO("yolov8n.pt")
+        try:
+            self.model.to('cuda')
+            self.model.half() # Quantization to FP16
+            self.logger.info("YOLOv8n running on CUDA (FP16)")
+        except:
+            self.logger.info("CUDA not available, running YOLOv8n on CPU (FP32)")
         
         self.logger.info("Initializing ArcFace (Identity)...")
         self.face_id = FaceIdentifier()
@@ -64,11 +102,34 @@ class StreamProcessor:
         self.tracker = DeepSortTracker(metric)
         self.encoder = SimpleEncoder()
         
-        # Track metadata store: { track_id: { 'class_id': int, 'identity': str, 'history': [] } }
-        self.track_metadata = {}
+        # Sighting Reporter (Async/Concurrency Management)
+        self.reporter = SightingReporter(self.backend_url)
+        
+        # Priority Targets (for Latency Optimization)
+        self.priority_targets = [] # List of names or plates to alert on immediately
+        
+        # Track-based Reporting Control: { (camera_id, track_id): last_report_time }
+        self.reported_tracks = {}
+        self.report_interval = 30 # Re-report every 30 seconds if still in view
 
         self.camera_id = self._setup_camera()
         self.is_running = True
+
+    def set_priority_target(self, target):
+        self.logger.info(f"Priority Target Set: {target}")
+        if target not in self.priority_targets:
+            self.priority_targets.append(target)
+
+    def _get_camera_coords(self):
+        """Helper to get current camera lat/lng from backend or local cache."""
+        try:
+            res = requests.get(f"{self.backend_url}cameras/{self.camera_id}/", timeout=1)
+            if res.status_code == 200:
+                data = res.json()
+                return data.get('latitude'), data.get('longitude')
+        except:
+            pass
+        return -1.285, 36.821 # Default fallback
 
     def _setup_camera(self):
         device_id = "CAM-LIVE-SIM"
@@ -90,6 +151,7 @@ class StreamProcessor:
             if res.status_code == 201:
                 return res.json().get('id')
         except:
+            self.logger.error("Failed to connect to backend during camera setup. Fail-soft mode active.")
             return None
 
     def classify_color(self, img_roi):
@@ -111,6 +173,10 @@ class StreamProcessor:
         self.logger.info(f"Starting Video Capture: {self.source}")
         cap = cv2.VideoCapture(self.source)
         
+        # FPS calculation for Success Criteria monitoring
+        fps_start_time = time.time()
+        fps_counter = 0
+        
         while self.is_running:
             ret, frame = cap.read()
             if not ret:
@@ -118,7 +184,8 @@ class StreamProcessor:
                 continue
 
             # 1. DETECTION (YOLO)
-            results = self.model(frame, verbose=False)
+            # Use augment=False and half precision (if enabled) for speed
+            results = self.model(frame, verbose=False, stream=False)
             detections = []
             
             # COCO: 0=Person, 2=Car, 3=Motorcycle, 5=Bus, 7=Truck
@@ -155,16 +222,18 @@ class StreamProcessor:
                 # A. PERSON PIPELINE (ArcFace)
                 if class_id == 0:
                     box_color = (0, 255, 65) # Green
+                    embedding = None
                     
-                    # Try to ID if not known
-                    if meta['identity'] == 'Unknown' and track.time_since_update == 0:
+                    # Try to ID or at least get embedding
+                    if track.time_since_update == 0:
                         face_roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+                        
                         # Register first person as 'Juma' for demo
                         if track_id == 1 and 'Juma Macharia' not in self.face_id.known_faces:
                             self.face_id.register_face(face_roi, "Juma Macharia")
                         
-                        name, conf = self.face_id.identify(face_roi)
-                        if name != "Unknown":
+                        name, conf, embedding = self.face_id.identify(face_roi)
+                        if name != "Unknown" and meta['identity'] == 'Unknown':
                             meta['identity'] = name
                             self.track_metadata[track_id] = meta
                     
@@ -173,7 +242,8 @@ class StreamProcessor:
                     if identity != "Unknown":
                         box_color = (0, 0, 255) # Red for known targets
                         label = f"TARGET: {identity}"
-                        self.report_sighting(track, "N/A", "N/A", identity, is_person=True)
+                    
+                    self.report_sighting(track, "N/A", "N/A", identity, is_person=True, embedding=embedding)
 
                 # B. VEHICLE PIPELINE (YOLO+Attr)
                 else:
@@ -185,14 +255,21 @@ class StreamProcessor:
                     v_type = veh_types.get(class_id, 'VEHICLE')
                     
                     label = f"{v_type} // {color}"
-                    self.report_sighting(track, f"Unknown-{track_id}", color, v_type, is_person=False)
+                    self.report_sighting(track, f"Unknown-{track_id}", color, v_type, is_person=False, embedding=None)
 
                 # Draw
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
                 cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
 
+            # Success Criteria Monitoring: FPS
+            fps_counter += 1
+            if time.time() - fps_start_time > 1:
+                self.logger.info(f"Performance: {fps_counter} FPS")
+                fps_counter = 0
+                fps_start_time = time.time()
+
             # Overlay
-            cv2.putText(frame, f"HAWKEYE v2.0 // ARCFACE ENABLED", (20, 30), 
+            cv2.putText(frame, f"HAWKEYE v2.1 // ORCHESTRATION ENABLED", (20, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 65), 2)
 
             with lock:
@@ -244,13 +321,24 @@ class StreamProcessor:
                 if best_iou > 0.3:
                     self.track_metadata[track.track_id] = {'class_id': best_cls, 'identity': 'Unknown'}
 
-    def report_sighting(self, track, plate, color, make, is_person=False):
+    def report_sighting(self, track, plate, color, make, is_person=False, embedding=None):
         now = time.time()
-        if hasattr(track, 'last_reported') and now - track.last_reported < 3:
+        track_key = (self.camera_id, track.track_id)
+        
+        # Check if we should report this track again
+        is_priority = (plate in self.priority_targets or make in self.priority_targets)
+        last_report = self.reported_tracks.get(track_key, 0)
+        
+        # Report if: Never reported OR interval passed OR it's a priority target we just identified
+        if now - last_report < self.report_interval and not is_priority:
             return
-        track.last_reported = now
+            
+        self.reported_tracks[track_key] = now
         
         bbox = track.to_tlbr()
+        # Use camera coordinates for "Road Snapping" (eliminating jitter)
+        lat, lng = self._get_camera_coords()
+        
         data = {
             "camera_id": self.camera_id,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -260,12 +348,13 @@ class StreamProcessor:
             "detected_plate": plate,
             "detected_color": color,
             "detected_make": make,
-            "is_person": is_person
+            "is_person": is_person,
+            "gps_lat": lat,
+            "gps_lng": lng,
+            "embedding": embedding.tolist() if embedding is not None else None
         }
-        try:
-            requests.post(f"{self.backend_url}sightings/", json=data, timeout=0.5)
-        except:
-            pass
+        # Asynchronous reporting via queue
+        self.reporter.report(data)
 
 def generate():
     global output_frame, lock
@@ -280,9 +369,20 @@ def generate():
 def video_feed():
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
+@flask_app.route("/briefing", methods=['POST'])
+def update_briefing():
+    data = request.json
+    target = data.get('target')
+    if target:
+        processor.set_priority_target(target)
+        return {"status": "Target Acquired"}, 200
+    return {"status": "No Target Specified"}, 400
+
 if __name__ == "__main__":
     processor = StreamProcessor(source="people.mp4")
     t = threading.Thread(target=processor.process_stream)
     t.daemon = True
     t.start()
+    # Concurrency Management: Run Flask in threaded mode
     flask_app.run(host="0.0.0.0", port=5001, debug=False, threaded=True, use_reloader=False)
+
