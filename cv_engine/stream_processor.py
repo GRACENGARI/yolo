@@ -7,7 +7,12 @@ from ultralytics import YOLO
 import numpy as np
 import threading
 import queue
+import os
+import argparse
 from flask import Flask, Response, request
+
+# Environment Variable Defaults
+DEFAULT_BACKEND = os.getenv("BACKEND_URL", "http://localhost:8000/api/v1/")
 
 # Import deep_sort components
 try:
@@ -15,6 +20,7 @@ try:
     from .core.deep_sort import nn_matching
     from .core.deep_sort.detection import Detection
     from .core.face_recognition import FaceIdentifier
+    from .core.enhancement import ForensicEnhancer
 except (ImportError, ValueError):
     import sys
     import os
@@ -23,6 +29,7 @@ except (ImportError, ValueError):
     from core.deep_sort import nn_matching
     from core.deep_sort.detection import Detection
     from core.face_recognition import FaceIdentifier
+    from core.enhancement import ForensicEnhancer
 
 # MJPEG Server Setup
 flask_app = Flask(__name__)
@@ -75,26 +82,35 @@ class SimpleEncoder:
         return np.array(features)
 
 class StreamProcessor:
-    def __init__(self, source="people.mp4", backend_url="http://localhost:8000/api/v1/", detection_threshold=0.4):
+    def __init__(self, source="people.mp4", backend_url=DEFAULT_BACKEND, detection_threshold=0.4, device=None):
         self.source = source
         self.backend_url = backend_url
         self.detection_threshold = detection_threshold
+        self.device = device or os.getenv("DEVICE", "cpu")
         
         self.logger = logging.getLogger("CV_ENGINE")
         logging.basicConfig(level=logging.INFO)
         
-        self.logger.info("Initializing YOLOv8n (Detection) with FP16...")
-        # FP16 Half precision for latency optimization
+        self.logger.info(f"Initializing YOLOv8n (Detection) on {self.device}...")
         self.model = YOLO("yolov8n.pt")
-        try:
-            self.model.to('cuda')
-            self.model.half() # Quantization to FP16
-            self.logger.info("YOLOv8n running on CUDA (FP16)")
-        except:
-            self.logger.info("CUDA not available, running YOLOv8n on CPU (FP32)")
         
-        self.logger.info("Initializing ArcFace (Identity)...")
-        self.face_id = FaceIdentifier()
+        try:
+            if self.device in ['cuda', 'gpu']:
+                self.model.to('cuda')
+                self.model.half() # FP16 for GPU
+                self.logger.info("YOLOv8n running on CUDA (FP16)")
+            else:
+                self.model.to('cpu')
+                self.logger.info("YOLOv8n running on CPU (FP32)")
+        except Exception as e:
+            self.logger.warning(f"Failed to set device {self.device}: {e}. Falling back to CPU.")
+            self.model.to('cpu')
+        
+        self.logger.info(f"Initializing ArcFace (Identity) on {self.device}...")
+        self.face_id = FaceIdentifier(device=self.device)
+
+        self.logger.info(f"Initializing Forensic Enhancer on {self.device}...")
+        self.enhancer = ForensicEnhancer(device=self.device)
         
         self.logger.info("Initializing DeepSORT Tracker...")
         max_cosine_distance = 0.4
@@ -111,6 +127,9 @@ class StreamProcessor:
         # Track-based Reporting Control: { (camera_id, track_id): last_report_time }
         self.reported_tracks = {}
         self.report_interval = 30 # Re-report every 30 seconds if still in view
+        
+        # Metadata storage for tracks: { track_id: { 'class_id': int, 'identity': str } }
+        self.track_metadata = {}
 
         self.camera_id = self._setup_camera()
         self.is_running = True
@@ -171,109 +190,130 @@ class StreamProcessor:
     def process_stream(self):
         global output_frame, lock
         self.logger.info(f"Starting Video Capture: {self.source}")
-        cap = cv2.VideoCapture(self.source)
-        
-        # FPS calculation for Success Criteria monitoring
-        fps_start_time = time.time()
-        fps_counter = 0
         
         while self.is_running:
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            cap = cv2.VideoCapture(self.source)
+            if not cap.isOpened():
+                self.logger.error(f"Failed to open source {self.source}. Retrying in 5s...")
+                time.sleep(5)
                 continue
 
-            # 1. DETECTION (YOLO)
-            # Use augment=False and half precision (if enabled) for speed
-            results = self.model(frame, verbose=False, stream=False)
-            detections = []
+            # FPS calculation for Success Criteria monitoring
+            fps_start_time = time.time()
+            fps_counter = 0
             
-            # COCO: 0=Person, 2=Car, 3=Motorcycle, 5=Bus, 7=Truck
-            target_classes = [0, 2, 3, 5, 7]
-            
-            raw_dets = [] # Keep raw for association
-            
-            for result in results:
-                for r in result.boxes.data.tolist():
-                    x1, y1, x2, y2, score, cls = r
-                    cls = int(cls)
-                    if cls in target_classes and score > self.detection_threshold:
-                        detections.append([int(x1), int(y1), int(x2), int(y2), score])
-                        raw_dets.append({'bbox': [x1, y1, x2, y2], 'class': cls})
+            while self.is_running:
+                ret, frame = cap.read()
+                if not ret:
+                    if "rtsp" in str(self.source).lower():
+                        self.logger.warning("RTSP Stream disconnected. Attempting reconnection...")
+                        break # Break inner loop to trigger cap.release() and reconnect
+                    else:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Loop local video
+                        continue
 
-            # 2. TRACKING (DeepSORT)
-            self.update_tracker(frame, detections, raw_dets)
+                # 1. DETECTION (YOLO)
+                results = self.model(frame, verbose=False, stream=False, device=self.device)
+                detections = []
+                
+                # COCO: 0=Person, 2=Car, 3=Motorcycle, 5=Bus, 7=Truck
+                target_classes = [0, 2, 3, 5, 7]
+                
+                raw_dets = [] # Keep raw for association
+                
+                for result in results:
+                    for r in result.boxes.data.tolist():
+                        x1, y1, x2, y2, score, cls = r
+                        cls = int(cls)
+                        if cls in target_classes and score > self.detection_threshold:
+                            detections.append([int(x1), int(y1), int(x2), int(y2), score])
+                            raw_dets.append({'bbox': [x1, y1, x2, y2], 'class': cls})
 
-            # 3. ANALYSIS & VISUALIZATION
-            for track in self.tracker.tracks:
-                if not track.is_confirmed() or track.time_since_update > 1:
-                    continue
-                
-                track_id = track.track_id
-                bbox = track.to_tlbr()
-                meta = self.track_metadata.get(track_id, {'class_id': 0, 'identity': 'Unknown'})
-                class_id = meta.get('class_id', 0)
-                
-                # Default Visuals
-                x1, y1, x2, y2 = map(int, bbox)
-                
-                # --- LOGIC SPLIT ---
-                
-                # A. PERSON PIPELINE (ArcFace)
-                if class_id == 0:
-                    box_color = (0, 255, 65) # Green
-                    embedding = None
+                # 2. TRACKING (DeepSORT)
+                self.update_tracker(frame, detections, raw_dets)
+
+                # 3. ANALYSIS & VISUALIZATION
+                for track in self.tracker.tracks:
+                    if not track.is_confirmed() or track.time_since_update > 1:
+                        continue
                     
-                    # Try to ID or at least get embedding
-                    if track.time_since_update == 0:
-                        face_roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+                    track_id = track.track_id
+                    bbox = track.to_tlbr()
+                    meta = self.track_metadata.get(track_id, {'class_id': 0, 'identity': 'Unknown'})
+                    class_id = meta.get('class_id', 0)
+                    
+                    # Default Visuals
+                    x1, y1, x2, y2 = map(int, bbox)
+                    
+                    # --- LOGIC SPLIT ---
+                    
+                    # A. PERSON PIPELINE (ArcFace + Enhancement)
+                    if class_id == 0:
+                        box_color = (0, 255, 65) # Green
+                        embedding = None
                         
-                        # Register first person as 'Juma' for demo
-                        if track_id == 1 and 'Juma Macharia' not in self.face_id.known_faces:
-                            self.face_id.register_face(face_roi, "Juma Macharia")
+                        # Try to ID or at least get embedding
+                        if track.time_since_update == 0:
+                            face_roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+                            
+                            # Register first person as 'Juma' for demo
+                            if track_id == 1 and 'Juma Macharia' not in self.face_id.known_faces:
+                                self.face_id.register_face(face_roi, "Juma Macharia")
+                            
+                            name, conf, embedding = self.face_id.identify(face_roi)
+                            
+                            # TRIGGER LOGIC: Enhance if distorted or low confidence
+                            if (conf < 0.4 or face_roi.shape[0] < 80) and face_roi.size > 0:
+                                enhanced_face = self.enhancer.enhance_face(face_roi)
+                                name_e, conf_e, embedding_e = self.face_id.identify(enhanced_face)
+                                
+                                if conf_e > conf:
+                                    self.logger.info(f"Forensic Enhancement Improved Confidence: {conf:.2f} -> {conf_e:.2f}")
+                                    name, conf, embedding = name_e, conf_e, embedding_e
+                                    # Log Audit Comparison
+                                    self.enhancer.save_forensic_audit(face_roi, enhanced_face, track_id)
+
+                            if name != "Unknown" and meta['identity'] == 'Unknown':
+                                meta['identity'] = name
+                                self.track_metadata[track_id] = meta
                         
-                        name, conf, embedding = self.face_id.identify(face_roi)
-                        if name != "Unknown" and meta['identity'] == 'Unknown':
-                            meta['identity'] = name
-                            self.track_metadata[track_id] = meta
-                    
-                    identity = meta['identity']
-                    label = f"PERSON // {identity}"
-                    if identity != "Unknown":
-                        box_color = (0, 0, 255) # Red for known targets
-                        label = f"TARGET: {identity}"
-                    
-                    self.report_sighting(track, "N/A", "N/A", identity, is_person=True, embedding=embedding)
+                        identity = meta['identity']
+                        label = f"PERSON // {identity}"
+                        if identity != "Unknown":
+                            box_color = (0, 0, 255) # Red for known targets
+                            label = f"TARGET: {identity}"
+                        
+                        self.report_sighting(track, "N/A", "N/A", identity, is_person=True, embedding=embedding)
 
-                # B. VEHICLE PIPELINE (YOLO+Attr)
-                else:
-                    box_color = (255, 200, 0) # Cyan/Orange
-                    veh_roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
-                    color = self.classify_color(veh_roi)
-                    
-                    veh_types = {2: 'CAR', 3: 'MOTO', 5: 'BUS', 7: 'TRUCK'}
-                    v_type = veh_types.get(class_id, 'VEHICLE')
-                    
-                    label = f"{v_type} // {color}"
-                    self.report_sighting(track, f"Unknown-{track_id}", color, v_type, is_person=False, embedding=None)
+                    # B. VEHICLE PIPELINE (YOLO+Attr)
+                    else:
+                        box_color = (255, 200, 0) # Cyan/Orange
+                        veh_roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+                        color = self.classify_color(veh_roi)
+                        
+                        veh_types = {2: 'CAR', 3: 'MOTO', 5: 'BUS', 7: 'TRUCK'}
+                        v_type = veh_types.get(class_id, 'VEHICLE')
+                        
+                        label = f"{v_type} // {color}"
+                        self.report_sighting(track, f"Unknown-{track_id}", color, v_type, is_person=False, embedding=None)
 
-                # Draw
-                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
-                cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
+                    # Draw
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 1)
+                    cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
 
-            # Success Criteria Monitoring: FPS
-            fps_counter += 1
-            if time.time() - fps_start_time > 1:
-                self.logger.info(f"Performance: {fps_counter} FPS")
-                fps_counter = 0
-                fps_start_time = time.time()
+                # Success Criteria Monitoring: FPS
+                fps_counter += 1
+                if time.time() - fps_start_time > 1:
+                    self.logger.info(f"Performance: {fps_counter} FPS")
+                    fps_counter = 0
+                    fps_start_time = time.time()
 
-            # Overlay
-            cv2.putText(frame, f"HAWKEYE v2.1 // ORCHESTRATION ENABLED", (20, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 65), 2)
+                # Overlay
+                cv2.putText(frame, f"HAWKEYE v2.1 // ORCHESTRATION ENABLED", (20, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 65), 2)
 
-            with lock:
-                output_frame = frame.copy()
+                with lock:
+                    output_frame = frame.copy()
 
     def update_tracker(self, frame, detections, raw_dets):
         if len(detections) == 0:
@@ -379,10 +419,27 @@ def update_briefing():
     return {"status": "No Target Specified"}, 400
 
 if __name__ == "__main__":
-    processor = StreamProcessor(source="people.mp4")
+    parser = argparse.ArgumentParser(description="MWEWE CV Engine // Phase 4")
+    parser.add_argument("--source", type=str, default="people.mp4", help="Video source (file path or RTSP URL)")
+    parser.add_argument("--backend", type=str, default=DEFAULT_BACKEND, help="Backend API URL")
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "gpu"], help="Hardware device to use")
+    parser.add_argument("--threshold", type=float, default=0.4, help="Detection threshold")
+    
+    args = parser.parse_args()
+
+    # Normalization: map 'gpu' to 'cuda' for YOLO/ArcFace
+    target_device = 'cuda' if args.device == 'gpu' else args.device
+
+    processor = StreamProcessor(
+        source=args.source, 
+        backend_url=args.backend, 
+        device=target_device,
+        detection_threshold=args.threshold
+    )
+    
     t = threading.Thread(target=processor.process_stream)
     t.daemon = True
     t.start()
+    
     # Concurrency Management: Run Flask in threaded mode
     flask_app.run(host="0.0.0.0", port=5001, debug=False, threaded=True, use_reloader=False)
-

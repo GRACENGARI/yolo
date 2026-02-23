@@ -14,7 +14,7 @@ except ImportError:
 logger = logging.getLogger("CV_ENGINE.FACE")
 
 class FaceIdentifier:
-    def __init__(self, model_name='buffalo_s', min_confidence=0.5):
+    def __init__(self, model_name='buffalo_s', min_confidence=0.5, device='cuda'):
         # Model Quantization: buffalo_s is the smaller/faster model for edge deployment
         self.known_faces = {} # { "name": embedding_vector }
         self.enabled = HAS_INSIGHTFACE
@@ -24,11 +24,15 @@ class FaceIdentifier:
             return
 
         try:
-            # Model Quantization & Edge Optimization: Try CUDA first
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            # Model Quantization & Edge Optimization: Handle explicit device toggle
+            if device == 'cuda' or device == 'gpu':
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            else:
+                providers = ['CPUExecutionProvider']
+                
             self.app = FaceAnalysis(name=model_name, providers=providers)
             self.app.prepare(ctx_id=0, det_size=(640, 640))
-            logger.info(f"ArcFace Model '{model_name}' (Quantized/Small) loaded successfully.")
+            logger.info(f"ArcFace Model '{model_name}' (Quantized/Small) initialized on {providers[0]}.")
         except Exception as e:
             logger.error(f"Failed to load InsightFace models: {e}. Falling back to CPU.")
             try:
