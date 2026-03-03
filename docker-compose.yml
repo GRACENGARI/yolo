@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  cv-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hawkeye_cv_engine
+    restart: unless-stopped
+    
+    environment:
+      # Hardware
+      - DEVICE=cpu
+      - DETECTION_THRESHOLD=0.4
+      - ENABLE_FP16=false
+      
+      # Backend connection
+      - BACKEND_URL=http://host.docker.internal:8000/api/v1/
+      - API_KEY=${API_KEY:-}
+      
+      # Video source
+      - VIDEO_SOURCE=people.mp4
+      
+      # Models
+      - YOLO_MODEL=yolov8n.pt
+      - ARCFACE_MODEL=buffalo_s
+      - REID_MODEL=osnet_x1_0
+      - ENHANCEMENT_MODEL=gfpgan
+      
+      # Forensics
+      - ENABLE_ENHANCEMENT=true
+      - ENHANCEMENT_THRESHOLD=0.4
+      - SAVE_FORENSIC_AUDIT=true
+      
+      # Logging
+      - LOG_LEVEL=INFO
+    
+    volumes:
+      # Mount video files
+      - ./people.mp4:/app/people.mp4:ro
+      
+      # Mount model weights (persistent)
+      - ./weights:/app/weights
+      
+      # Mount forensic audit output
+      - ./forensic_audit:/app/forensic_audit
+      
+      # Mount training data (if needed)
+      - ./training_data:/app/training_data:ro
+      
+      # Mount logs
+      - ./logs:/app/logs
+    
+    ports:
+      - "5001:5001"  # MJPEG stream server
+    
+    networks:
+      - hawkeye_network
+    
+    # GPU support (uncomment for CUDA)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/video_feed"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Run with GPU on remote server
+  cv-engine-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hawkeye_cv_engine_gpu
+    restart: unless-stopped
+    profiles:
+      - gpu  # Only start with: docker-compose --profile gpu up
+    
+    environment:
+      - DEVICE=cuda
+      - DETECTION_THRESHOLD=0.4
+      - ENABLE_FP16=true
+      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000/api/v1/}
+      - API_KEY=${API_KEY}
+      - VIDEO_SOURCE=${VIDEO_SOURCE:-rtsp://camera.local/stream}
+      - ENABLE_ENHANCEMENT=true
+      - ENHANCEMENT_MODEL=gfpgan
+      - VRAM_LIMIT_MB=8192
+    
+    volumes:
+      - ./weights:/app/weights
+      - ./forensic_audit:/app/forensic_audit
+      - ./logs:/app/logs
+    
+    ports:
+      - "5001:5001"
+    
+    networks:
+      - hawkeye_network
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/video_feed"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  hawkeye_network:
+    driver: bridge
+    name: hawkeye_network
+
+volumes:
+  weights:
+  forensic_audit:
+  logs:

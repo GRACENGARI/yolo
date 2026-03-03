@@ -8,3 +8,27 @@ lapx
 insightface
 onnxruntime
 flask
+python-dotenv
+torch
+torchvision
+torchreid
+gfpgan
+basicsr
+facexlib
+realesrgan
+python-dotenv
+psutil
+
+# Optional: For advanced ReID tracking
+# torchreid
+# torch
+# torchvision
+
+# Optional: For GFPGAN forensic enhancement
+# gfpgan
+# basicsr
+# facexlib
+# realesrgan
+
+# Optional: For GPU monitoring
+# nvidia-ml-py3

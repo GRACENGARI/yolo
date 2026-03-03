@@ -3,7 +3,6 @@ import time
 import requests
 import json
 import logging
-from ultralytics import YOLO
 import numpy as np
 import threading
 import queue
@@ -11,35 +10,52 @@ import os
 import argparse
 from flask import Flask, Response, request
 
-# Environment Variable Defaults
-DEFAULT_BACKEND = os.getenv("BACKEND_URL", "http://localhost:8000/api/v1/")
-
-# Import deep_sort components
+# Import configuration
 try:
+    from .config import config
+    from .utils.auth import AuthManager
+    from .utils.stream_manager import StreamManager
+    from .utils.vram_monitor import VRAMMonitor
     from .core.deep_sort.tracker import Tracker as DeepSortTracker
     from .core.deep_sort import nn_matching
     from .core.deep_sort.detection import Detection
     from .core.face_recognition import FaceIdentifier
-    from .core.enhancement import ForensicEnhancer
+    from .core.forensic_enhancer_v2 import AdvancedForensicEnhancer
+    from .core.reid_encoder import OSNetEncoder
 except (ImportError, ValueError):
     import sys
-    import os
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from config import config
+    from utils.auth import AuthManager
+    from utils.stream_manager import StreamManager
+    from utils.vram_monitor import VRAMMonitor
     from core.deep_sort.tracker import Tracker as DeepSortTracker
     from core.deep_sort import nn_matching
     from core.deep_sort.detection import Detection
     from core.face_recognition import FaceIdentifier
-    from core.enhancement import ForensicEnhancer
+    from core.forensic_enhancer_v2 import AdvancedForensicEnhancer
+    from core.reid_encoder import OSNetEncoder
 
 # MJPEG Server Setup
 flask_app = Flask(__name__)
 output_frame = None
 lock = threading.Lock()
 
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(config.LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+
 class SightingReporter:
-    def __init__(self, backend_url):
+    def __init__(self, backend_url, auth_manager):
         self.backend_url = backend_url
-        self.queue = queue.Queue(maxsize=100)
+        self.auth = auth_manager
+        self.queue = queue.Queue(maxsize=config.REPORT_QUEUE_SIZE)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
@@ -56,10 +72,10 @@ class SightingReporter:
             try:
                 data = self.queue.get(timeout=1)
                 try:
-                    res = requests.post(f"{self.backend_url}sightings/", json=data, timeout=1.0)
-                    if res.status_code != 201:
+                    res = self.auth.make_request('POST', f"{self.backend_url}sightings/", json=data)
+                    if res and res.status_code != 201:
                         self.logger.error(f"Failed to report sighting: {res.status_code}")
-                except requests.exceptions.RequestException as e:
+                except Exception as e:
                     self.logger.error(f"Network error reporting sighting: {e}")
                 finally:
                     self.queue.task_done()
